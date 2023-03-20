@@ -91,6 +91,12 @@ found:
 
   release(&ptable.lock);
 
+
+  // Ensure thread stack points to zero, indicating this is not a thread
+  // When a thread is created this will point to the stack,
+  // We will use this variable to make sure we are waiting for a process in wait
+  // and in join we will use this make sure we are waiting for a thread
+  p->thread_stack = (void*)0;
   // Allocate kernel stack.
   if((p->kstack = kalloc()) == 0){
     p->state = UNUSED;
@@ -161,14 +167,20 @@ growproc(int n)
   uint sz;
   struct proc *curproc = myproc();
 
+   acquire(&ptable.lock);
   sz = curproc->sz;
   if(n > 0){
-    if((sz = allocuvm(curproc->pgdir, sz, sz + n)) == 0)
+    if((sz = allocuvm(curproc->pgdir, sz, sz + n)) == 0){
+       release(&ptable.lock);
       return -1;
+    }
   } else if(n < 0){
-    if((sz = deallocuvm(curproc->pgdir, sz, sz + n)) == 0)
+    if((sz = deallocuvm(curproc->pgdir, sz, sz + n)) == 0){
+       release(&ptable.lock);
       return -1;
+    }
   }
+   release(&ptable.lock);
   curproc->sz = sz;
   switchuvm(curproc);
   return 0;
@@ -281,7 +293,9 @@ wait(void)
     // Scan through table looking for exited children.
     havekids = 0;
     for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
-      if(p->parent != curproc)
+     // Here with p->thread_stack not being equal to zero we confirm that this is a thread
+     // and we do no want to wait on this.
+      if(p->parent != curproc || p->thread_stack != (void*)0)
         continue;
       havekids = 1;
       if(p->state == ZOMBIE){
@@ -531,4 +545,110 @@ procdump(void)
     }
     cprintf("\n");
   }
+}
+
+int 
+join(void** stack)
+{
+//   cprintf("Called user join\n");
+  struct proc *p;
+  int havekids, pid;
+  struct proc *curproc = myproc();
+
+
+  acquire(&ptable.lock);
+  for(;;){
+    // Scan through table looking for exited children.
+    havekids = 0;
+    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+      // Here with p->thread_stack being equal to zero we're checking if this is
+      // a thread. If equal to zero this is not a thread
+      if(p->parent != curproc || p->thread_stack == (void*)0)
+        continue;
+      havekids = 1;
+      if(p->state == ZOMBIE){
+        // Found one.
+        pid = p->pid;
+        //kfree(p->kstack);
+        p->kstack = 0;
+        //freevm(p->pgdir);
+        p->pid = 0;
+        p->parent = 0;
+        p->name[0] = 0;
+        p->killed = 0;
+        p->state = UNUSED;
+        *stack = p->thread_stack;
+        release(&ptable.lock);
+        return pid;
+      }
+    }
+
+    // No point waiting if we don't have any children.
+    if(!havekids || curproc->killed){
+      release(&ptable.lock);
+      return -1;
+    }
+
+    // Wait for children to exit.  (See wakeup1 call in proc_exit.)
+    sleep(curproc, &ptable.lock);  //DOC: wait-sleep
+  }
+    return 0;
+}
+
+int
+clone(void(*fnc)(void *, void*), void *arg1, void *arg2, void *stack)
+{
+    if ((uint*)stack == 0)
+        return -1;
+    //cprintf("Called user clone\n");
+    int i, pid;
+    struct proc *np;
+    struct proc *curproc = myproc();
+
+    // Allocate a new process for the thread.
+    if((np= allocproc()) == 0)
+        return -1;
+    //cprintf("Allocated process in clone\n");
+    // Do not need to copy the user memory
+    // Share address space
+    np->pgdir = curproc->pgdir;
+
+    np->sz = curproc->sz;
+    np->parent = curproc;
+    *np->tf = *curproc->tf;
+
+    //Setup stack and returns here
+    np->thread_stack = stack;
+    //cprintf("Stack is contained at: %d\n", (int)stack);
+    //cprintf("Arg1 value %d\n", (uint)arg1);
+    //cprintf("Arg2 value %d\n", (uint)arg2);
+    //uint* stack+PGSIZE = stack+PGSIZE;
+    *(uint*)(stack+PGSIZE-sizeof(uint)*1) = (uint)arg2;
+    *(uint*)(stack+PGSIZE-sizeof(uint)*2) = (uint)arg1;
+    //cprintf("Assigned args1: %d, args2: %d\n", (stack+PGSIZE-8), (stack+PGSIZE-4));
+    *(uint*)(stack+PGSIZE-sizeof(uint)*3) = 0xFFFFFFFF;
+    np->tf->esp = (uint)(stack+PGSIZE-sizeof(uint)*3);
+    np->tf->ebp = (uint)(stack+PGSIZE-sizeof(uint)*3);
+    //cprintf("Created stack in clone\n");
+    // Clear %eax so that clone returns 0 in the child
+    np->tf->eax = 0;
+    np->tf->eip = (uint)fnc;
+
+    for(i = 0; i < NOFILE; i++)
+        if(curproc->ofile[i])
+            np->ofile[i] = filedup(curproc->ofile[i]);
+    np->cwd = idup(curproc->cwd);
+
+    safestrcpy(np->name, curproc->name, sizeof(curproc->name));
+
+    pid = np->pid;
+
+    acquire(&ptable.lock);
+
+    np->state = RUNNABLE;
+
+    release(&ptable.lock);
+
+    //cprintf("Returning from user clone\n");
+    return pid;
 }
